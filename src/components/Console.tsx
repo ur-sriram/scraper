@@ -1,153 +1,232 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Icon } from "./icons";
-import type { Phase } from "../lib/types";
+import type { ExtractInput } from "../lib/engine";
 
-const SAMPLES = [
-  { slug: "priya-sharma-ml", tag: "ML / RAG" },
-  { slug: "marcus-chen-platform", tag: "DevOps" },
-  { slug: "sofia-reyes-frontend", tag: "Full-stack" },
-  { slug: "arjun-mehta-appsec", tag: "Security" },
-];
-
-interface Props {
-  value: string;
-  onChange: (v: string) => void;
-  onSubmit: () => void;
-  onAbort: () => void;
-  phase: Phase;
+interface ConsoleProps {
+  targets: ExtractInput;
+  onTarget: (patch: Partial<ExtractInput>) => void;
+  pastedText: string;
+  onPastedText: (v: string) => void;
+  onRun: () => void;
+  busy: boolean;
   error: string | null;
 }
 
-function RuntimeRow({ label, value, tone, blink }: { label: string; value: string; tone: string; blink?: boolean }) {
+const SOURCES: { key: keyof ExtractInput; label: string; icon: string; prefix: string; placeholder: string; samples: { v: string; hint: string }[] }[] = [
+  {
+    key: "linkedin",
+    label: "LinkedIn profile",
+    icon: "linkedin",
+    prefix: "in/",
+    placeholder: "https://www.linkedin.com/in/ur-sriram/  or just the slug",
+    samples: [
+      { v: "ur-sriram", hint: "your test target" },
+      { v: "williamhgates", hint: "public profile" },
+    ],
+  },
+  {
+    key: "github",
+    label: "GitHub username",
+    icon: "github",
+    prefix: "gh/",
+    placeholder: "username or github.com/username",
+    samples: [
+      { v: "gaearon", hint: "React core" },
+      { v: "sindresorhus", hint: "900+ repos" },
+    ],
+  },
+  {
+    key: "leetcode",
+    label: "LeetCode username",
+    icon: "leetcode",
+    prefix: "lc/",
+    placeholder: "username or leetcode.com/u/username",
+    samples: [
+      { v: "kamyu104", hint: "top rank" },
+      { v: "lee215", hint: "top rank" },
+    ],
+  },
+];
+
+export function Console({ targets, onTarget, pastedText, onPastedText, onRun, busy, error }: ConsoleProps) {
+  const filled = [targets.linkedin, targets.github, targets.leetcode].filter((t) => (t ?? "").trim()).length;
+  const [pasteOpen, setPasteOpen] = useState(false);
+
   return (
-    <div className="flex items-center justify-between gap-3 py-[7px] border-b border-ink-700/50 last:border-0">
-      <span className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-fog-600">{label}</span>
-      <span className="flex items-center gap-2 font-mono text-[11px] text-fog-300">
-        <i
-          className={`w-1.5 h-1.5 rounded-full ${blink ? "led-fast" : ""}`}
-          style={{ background: tone, boxShadow: `0 0 8px ${tone}66` }}
-        />
-        {value}
-      </span>
-    </div>
-  );
-}
+    <section id="console" className="relative">
+      <div className="panel-frame p-6 sm:p-8">
+        <span className="corner" aria-hidden="true" />
 
-export function Console({ value, onChange, onSubmit, onAbort, phase, error }: Props) {
-  const [uptime, setUptime] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setUptime((u) => u + 1), 1000);
-    return () => clearInterval(t);
-  }, []);
-  const running = phase === "running";
-  const h = Math.floor(uptime / 3600), m = Math.floor((uptime % 3600) / 60), s = uptime % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
-
-  return (
-    <section className="panel-frame reveal">
-      <span className="corner" />
-      <div className="grid lg:grid-cols-[1fr_300px]">
-        {/* -------- target input -------- */}
-        <div className="p-6 sm:p-8">
-          <div className="flex items-center gap-3 mb-6">
-            <span className="font-mono text-[10.5px] tracking-[0.22em] uppercase text-mint-400">Extraction Console</span>
-            <span className="h-px flex-1 bg-gradient-to-r from-mint-400/40 to-transparent" />
-            <span className="font-mono text-[10.5px] tracking-[0.14em] uppercase text-fog-600">depth: full · 11 modules</span>
-          </div>
-
-          <label htmlFor="target" className="block font-display text-2xl sm:text-[28px] font-semibold tracking-tight text-fog-100 mb-1">
-            Feed it a profile. Get a knowledge graph.
-          </label>
-          <p className="text-fog-500 text-sm mb-6 max-w-xl leading-relaxed">
-            Paste any public LinkedIn URL or username — SIEVE's maxun-core runtime walks the page, parses{" "}
-            <span className="text-fog-300 font-mono text-[12.5px]">247 selector nodes</span> and returns a structured,
-            embed-ready talent profile.
-          </p>
-
-          <form
-            onSubmit={(e) => { e.preventDefault(); onSubmit(); }}
-            className={`flex flex-col sm:flex-row gap-3 ${error ? "shake" : ""}`}
-          >
-            <div className={`flex-1 flex items-stretch border bg-ink-950/70 transition-colors focus-within:border-mint-400/70 ${error ? "border-blush-400/70" : "border-ink-600/70"}`}>
-              <span className="hidden sm:flex items-center px-3 font-mono text-[12px] text-fog-600 border-r border-ink-700/70 select-none whitespace-nowrap">
-                linkedin.com/in/
+        <div className="grid lg:grid-cols-[1.25fr_0.75fr] gap-8">
+          {/* ------- targets ------- */}
+          <div>
+            <div className="flex items-center gap-3 mb-1">
+              <span className="inline-flex items-center gap-2 font-mono text-[11px] tracking-[0.18em] text-mint-400">
+                <span className="w-1.5 h-1.5 bg-mint-400 rounded-full led" />
+                TARGET ACQUISITION
               </span>
-              <input
-                id="target"
-                value={value}
-                disabled={running}
-                onChange={(e) => onChange(e.target.value)}
-                placeholder="priya-sharma-ml"
-                spellCheck={false}
-                autoComplete="off"
-                className="flex-1 bg-transparent px-3 sm:px-4 py-3.5 font-mono text-[13.5px] text-fog-100 placeholder-fog-600 outline-none min-w-0"
-              />
-              {running && <span className="flex items-center pr-3"><span className="w-2 h-4 bg-mint-400 cursor-blink" /></span>}
             </div>
-            {running ? (
+            <h2 className="font-display text-2xl sm:text-[28px] font-semibold tracking-tight text-fog-100 mb-1">
+              Point the extractor at real handles.
+            </h2>
+            <p className="text-fog-500 text-sm max-w-xl mb-6">
+              LinkedIn is fetched live (rendered page reader + public HTML via CORS relays), GitHub hits the official
+              REST API, LeetCode tries three public stats endpoints. Every value in the dossier below is parsed from
+              those wire responses — <span className="text-mint-300">nothing is generated or guessed</span>.
+            </p>
+
+            <div className="space-y-4">
+              {SOURCES.map((s) => (
+                <div key={s.key}>
+                  <label htmlFor={`t-${s.key}`} className="flex items-center gap-2 font-mono text-[11px] tracking-[0.14em] text-fog-500 uppercase mb-1.5">
+                    <Icon name={s.icon} className="w-3.5 h-3.5 text-mint-400" />
+                    {s.label}
+                    {s.key !== "linkedin" && <span className="text-fog-600 normal-case tracking-normal">· optional</span>}
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 font-mono text-fog-600 text-sm pointer-events-none">
+                      {s.prefix}
+                    </span>
+                    <input
+                      id={`t-${s.key}`}
+                      type="text"
+                      spellCheck={false}
+                      autoComplete="off"
+                      value={targets[s.key] ?? ""}
+                      disabled={busy}
+                      onChange={(e) => onTarget({ [s.key]: e.target.value } as Partial<ExtractInput>)}
+                      onKeyDown={(e) => e.key === "Enter" && !busy && onRun()}
+                      placeholder={s.placeholder}
+                      className={`w-full bg-ink-950/80 border text-fog-100 placeholder:text-fog-600 font-mono text-sm px-3 py-2.5 pl-11 outline-none transition-colors focus:border-mint-400/70 disabled:opacity-50 ${
+                        error && s.key === "linkedin" ? "border-blush-400/70" : "border-ink-600/70"
+                      }`}
+                    />
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 mt-2">
+                    <span className="font-mono text-[10px] text-fog-600 self-center mr-1">try:</span>
+                    {s.samples.map((sm) => (
+                      <button
+                        key={sm.v}
+                        type="button"
+                        disabled={busy}
+                        onClick={() => onTarget({ [s.key]: sm.v } as Partial<ExtractInput>)}
+                        className="group font-mono text-[11px] px-2 py-0.5 border border-ink-600/70 text-fog-300 hover:border-mint-400/60 hover:text-mint-300 transition-colors disabled:opacity-40"
+                        title={sm.hint}
+                      >
+                        {sm.v}
+                        <span className="text-fog-600 group-hover:text-mint-400/70 ml-1.5">↗</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* paste fallback */}
+            <div className="mt-5 border border-ink-700/70 bg-ink-950/40">
               <button
                 type="button"
-                onClick={onAbort}
-                className="group flex items-center justify-center gap-2 px-6 py-3.5 border border-blush-400/60 text-blush-400 font-mono text-[12px] tracking-[0.18em] uppercase hover:bg-blush-400/10 transition-colors"
+                onClick={() => setPasteOpen((o) => !o)}
+                className="w-full flex items-center justify-between px-4 py-2.5 text-left group"
               >
-                <Icon name="stop" className="w-3.5 h-3.5" /> Abort <span className="text-fog-600 normal-case tracking-normal hidden sm:inline">esc</span>
+                <span className="flex items-center gap-2 font-mono text-[11px] tracking-[0.14em] text-fog-500 uppercase group-hover:text-fog-300 transition-colors">
+                  <Icon name="terminal" className="w-3.5 h-3.5 text-ember-400" />
+                  authwall bypass — paste the profile text
+                </span>
+                <span className={`font-mono text-fog-600 transition-transform ${pasteOpen ? "rotate-90" : ""}`}>›</span>
               </button>
-            ) : (
-              <button
-                type="submit"
-                className="group flex items-center justify-center gap-2.5 px-7 py-3.5 bg-mint-400 text-ink-950 font-mono text-[12px] font-semibold tracking-[0.18em] uppercase hover:bg-mint-300 active:translate-y-px transition-all shadow-[0_0_28px_rgba(62,207,142,0.25)]"
-              >
-                <Icon name="run" className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
-                Run extraction
-                <span className="opacity-50 hidden sm:inline">⏎</span>
-              </button>
+              {pasteOpen && (
+                <div className="px-4 pb-4">
+                  <p className="text-xs text-fog-500 leading-relaxed mb-2">
+                    If LinkedIn's authwall blocks the anonymous fetch, open the profile while signed in, select-all the
+                    page text (or copy the rendered markdown), and paste it here. The extractor parses it locally with
+                    the same field rules — <span className="text-ember-300">still your real data, never synthetic</span>.
+                  </p>
+                  <textarea
+                    value={pastedText}
+                    onChange={(e) => onPastedText(e.target.value)}
+                    disabled={busy}
+                    rows={5}
+                    spellCheck={false}
+                    placeholder="Paste the LinkedIn profile text / page source here…"
+                    className="w-full bg-ink-950/80 border border-ink-600/70 text-fog-100 placeholder:text-fog-600 font-mono text-xs px-3 py-2.5 outline-none focus:border-ember-400/60 disabled:opacity-50 resize-y"
+                  />
+                  {pastedText.trim() && (
+                    <p className="mt-1.5 font-mono text-[10px] text-ember-300">
+                      {(pastedText.length / 1024).toFixed(1)} KB staged — will be used for the LinkedIn module
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {error && (
+              <div className="shake mt-4 flex items-start gap-2 border border-blush-400/50 bg-blush-400/5 px-3 py-2.5 text-sm text-blush-400">
+                <Icon name="warn" className="w-4 h-4 mt-0.5 shrink-0" />
+                <span>{error}</span>
+              </div>
             )}
-          </form>
 
-          {error && (
-            <p className="mt-3 flex items-center gap-2 text-blush-400 text-[13px] font-mono">
-              <Icon name="warn" className="w-4 h-4 shrink-0" /> {error}
-            </p>
-          )}
-
-          <div className="mt-6 flex flex-wrap items-center gap-2">
-            <span className="font-mono text-[10.5px] uppercase tracking-[0.16em] text-fog-600 mr-1">Quick targets</span>
-            {SAMPLES.map((smp) => (
+            <div className="mt-6 flex flex-wrap items-center gap-4">
               <button
-                key={smp.slug}
-                disabled={running}
-                onClick={() => { onChange(smp.slug); }}
-                className="group flex items-center gap-2 px-3 py-1.5 border border-ink-700 hover:border-mint-400/60 bg-ink-900/60 transition-colors disabled:opacity-40"
+                type="button"
+                onClick={onRun}
+                disabled={busy}
+                className="group relative inline-flex items-center gap-3 bg-mint-400 text-ink-950 font-display font-semibold text-sm tracking-wide px-6 py-3 hover:bg-mint-300 active:translate-y-px transition-all disabled:opacity-40 disabled:pointer-events-none"
               >
-                <span className="font-mono text-[12px] text-fog-300 group-hover:text-mint-300 transition-colors">/in/{smp.slug}</span>
-                <span className="text-[10px] font-mono uppercase tracking-wider text-ember-400/90 border border-ember-400/30 px-1.5 py-px">{smp.tag}</span>
+                <Icon name={busy ? "stop" : "run"} className="w-4 h-4" strokeWidth={2.2} />
+                {busy ? "EXTRACTING — LIVE" : "RUN LIVE EXTRACTION"}
+                <span className="font-mono text-[10px] font-medium opacity-70 border-l border-ink-950/30 pl-3">
+                  {filled}/3 sources
+                </span>
               </button>
-            ))}
+              <p className="font-mono text-[11px] text-fog-600 max-w-[260px]">
+                needs ≥ 1 handle · ESC aborts mid-run · anonymous GitHub tier = 60 req/h
+              </p>
+            </div>
           </div>
+
+          {/* ------- runtime status ------- */}
+          <aside className="border-l-0 lg:border-l border-ink-700/60 lg:pl-8">
+            <div className="flex items-center justify-between mb-4">
+              <span className="font-mono text-[11px] tracking-[0.18em] text-fog-500">RUNTIME</span>
+              <span className={`inline-flex items-center gap-1.5 font-mono text-[11px] ${busy ? "text-ember-400" : "text-mint-400"}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${busy ? "bg-ember-400 led-fast" : "bg-mint-400"}`} />
+                {busy ? "ON THE WIRE" : "IDLE"}
+              </span>
+            </div>
+            <dl className="space-y-3 text-sm">
+              {[
+                { k: "engine", v: "sieve live-extract v3 · ladder", mono: true },
+                { k: "L1", v: "voyager <code> JSON blobs", mono: true },
+                { k: "L2", v: "rendered DOM · class selectors", mono: true },
+                { k: "L3 / L4", v: "reader markdown · og/meta shell", mono: true },
+                { k: "L5 / L6", v: "Wayback snapshot · search index", mono: true },
+                { k: "auth tier", v: "Phase 01.5 · maxun-core + session cookie", mono: false },
+              ].map((r) => (
+                <div key={r.k} className="flex items-baseline justify-between gap-3 border-b border-ink-800/80 pb-2.5">
+                  <dt className="font-mono text-[11px] text-fog-600 uppercase tracking-wider shrink-0">{r.k}</dt>
+                  <dd className={`text-right text-fog-300 text-xs ${r.mono ? "font-mono" : ""}`}>{r.v}</dd>
+                </div>
+              ))}
+            </dl>
+
+            <div className="mt-6 border border-ember-400/30 bg-ember-400/5 p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <Icon name="shield" className="w-4 h-4 text-ember-400" />
+                <span className="font-display text-sm font-semibold text-ember-300">The honest bit</span>
+              </div>
+              <p className="text-xs leading-relaxed text-fog-500">
+                LinkedIn serves anonymous browsers an <span className="text-ember-300 font-mono">authwall</span>. The
+                ladder exploits every anonymous opening — L1 recovers the Voyager JSON blobs LinkedIn hides in{" "}
+                <span className="font-mono text-ember-300">&lt;code&gt;</span> tags, L2 parses the rendered DOM, L5
+                pulls Wayback snapshots, L6 mines the search index. Whatever still sits behind login is reported as{" "}
+                <span className="font-mono text-ember-300">AUTH</span>, never invented. GitHub &amp; LeetCode are open
+                APIs — 100% live. Paste the profile text to unlock the rest without a backend.
+              </p>
+            </div>
+          </aside>
         </div>
-
-        {/* -------- runtime status -------- */}
-        <aside className="border-t lg:border-t-0 lg:border-l border-ink-700/60 bg-ink-950/40 p-6">
-          <div className="flex items-center justify-between mb-3">
-            <span className="font-mono text-[10.5px] uppercase tracking-[0.2em] text-fog-600">Runtime</span>
-            <span className={`flex items-center gap-1.5 font-mono text-[10.5px] ${running ? "text-mint-400" : "text-fog-500"}`}>
-              <i className={`w-1.5 h-1.5 rounded-full ${running ? "bg-mint-400 led-fast" : "bg-mint-500"}`} style={{ boxShadow: "0 0 8px rgba(62,207,142,0.6)" }} />
-              {running ? "SCRAPING" : "ONLINE"}
-            </span>
-          </div>
-          <RuntimeRow label="Engine" value="maxun-core v0.9.2" tone="#3ecf8e" blink={running} />
-          <RuntimeRow label="Selector map" value="linkedin-public@v11" tone="#3ecf8e" />
-          <RuntimeRow label="Proxy pool" value="residential · IN/US/SG" tone="#f5b84b" />
-          <RuntimeRow label="Anti-bot" value="stealth chromium" tone="#3ecf8e" />
-          <RuntimeRow label="Uptime" value={`${pad(h)}:${pad(m)}:${pad(s)}`} tone="#5cc8ff" />
-
-          <div className="mt-5 pt-4 border-t border-ink-700/50">
-            <p className="font-mono text-[10.5px] leading-relaxed text-fog-600">
-              Phase 01 target: <span className="text-fog-300">LinkedIn knowledge layer</span>. GitHub + LeetCode
-              ingestion ships in Phases 02–03 and merges into the same embedding graph.
-            </p>
-          </div>
-        </aside>
       </div>
     </section>
   );
