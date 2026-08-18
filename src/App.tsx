@@ -1,40 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Console } from "./components/Console";
-import { Pipeline, type ModuleUi, type SourceUi } from "./components/Pipeline";
+import { Pipeline, type LogLine } from "./components/Pipeline";
 import { Dossier } from "./components/Dossier";
 import { Icon, LogoMark } from "./components/icons";
 import {
-  SOURCE_PLAN,
-  extractAll,
-  parseGithubHandle,
-  parseLeetcodeHandle,
-  parseLinkedinSlug,
-  toExport,
+  extract,
+  toExportPayload,
   type Extraction,
+  type ExtractInput,
+  type LogTone,
+  type ModuleData,
   type SourceId,
-  type Targets,
-  type Tone,
+  type SourceUi,
 } from "./lib/engine";
 import type { Phase } from "./lib/types";
-
-interface LogLine {
-  t: string;
-  text: string;
-  tone: Tone;
-}
 
 const ROADMAP = [
   {
     tag: "01",
     name: "Public tier",
     state: "current",
-    body: "Live LinkedIn meta parsing + GitHub REST + LeetCode stats — straight from the wire, in-browser.",
+    body: "Rendered-page reader + CORS-relay HTML parsing for LinkedIn, live GitHub REST, LeetCode stats — all in-browser.",
   },
   {
     tag: "01.5",
     name: "Auth tier",
     state: "next",
-    body: "maxun-core with your session cookie + stealth Chromium unlocks the 12 auth-gated spec fields.",
+    body: "maxun-core with your session cookie + stealth Chromium unlocks the auth-gated spec fields. Paste-profile bypass ships today.",
   },
   {
     tag: "02",
@@ -46,16 +38,17 @@ const ROADMAP = [
     tag: "03",
     name: "Embed & match",
     state: "planned",
-    body: "Module-scoped chunks → vector store → cosine matching against job descriptions.",
+    body: "Module-scoped, status-weighted chunks → vector store → cosine matching against job descriptions.",
   },
 ];
 
 export default function App() {
-  const [targets, setTargets] = useState<Targets>({
-    linkedin: "https://www.linkedin.com/in/sebastin-louis/",
+  const [targets, setTargets] = useState<ExtractInput>({
+    linkedin: "ur-sriram",
     github: "",
     leetcode: "",
   });
+  const [pastedText, setPastedText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [extraction, setExtraction] = useState<Extraction | null>(null);
@@ -64,7 +57,11 @@ export default function App() {
     github: "queued",
     leetcode: "queued",
   });
-  const [moduleStatus, setModuleStatus] = useState<Record<string, ModuleUi>>({});
+  const [modules, setModules] = useState<Record<SourceId, ModuleData[]>>({
+    linkedin: [],
+    github: [],
+    leetcode: [],
+  });
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
@@ -81,7 +78,7 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  /* scroll-reveal for per-phase sections */
+  /* scroll-reveal */
   useEffect(() => {
     const els = document.querySelectorAll(".reveal:not(.in)");
     const obs = new IntersectionObserver(
@@ -109,10 +106,8 @@ export default function App() {
   }, []);
 
   const run = async () => {
-    const li = parseLinkedinSlug(targets.linkedin);
-    const gh = parseGithubHandle(targets.github);
-    const lc = parseLeetcodeHandle(targets.leetcode);
-    if (!li && !gh && !lc) {
+    const anyTarget = [targets.linkedin, targets.github, targets.leetcode].some((t) => (t ?? "").trim());
+    if (!anyTarget) {
       setError("Give me at least one real handle — a LinkedIn slug/URL, a GitHub username, or a LeetCode username.");
       return;
     }
@@ -122,72 +117,71 @@ export default function App() {
     setExtraction(null);
     setLogs([]);
     setElapsedMs(0);
+    setSourceStatus({ linkedin: "queued", github: "queued", leetcode: "queued" });
+    setModules({ linkedin: [], github: [], leetcode: [] });
     startRef.current = performance.now();
 
-    setSourceStatus({
-      linkedin: li ? "queued" : "off",
-      github: gh ? "queued" : "off",
-      leetcode: lc ? "queued" : "off",
-    });
-    const initModules: Record<string, ModuleUi> = {};
-    SOURCE_PLAN.forEach((s) => s.modules.forEach((m) => (initModules[m.key] = "pending")));
-    setModuleStatus(initModules);
-
+    const ac = new AbortController();
     const fmtT = () => {
       const el = (performance.now() - startRef.current) / 1000;
       const m = Math.floor(el / 60);
       const s = (el % 60).toFixed(1).padStart(4, "0");
       return `[${String(m).padStart(2, "0")}:${s}]`;
     };
-    const log = (text: string, tone: Tone = "info") => setLogs((ls) => [...ls, { t: fmtT(), text, tone }]);
-
-    log(
-      `sieve live-extract v2 · targets: ${[li && `linkedin/in/${li}`, gh && `gh/${gh}`, lc && `lc/${lc}`].filter(Boolean).join(" · ")}`,
-      "dim",
-    );
+    const log = (text: string, tone: LogTone = "info") => {
+      setLogs((ls) => [...ls, { t: fmtT(), text, tone }]);
+    };
+    const onAbort = () => ac.abort();
+    const escHandler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onAbort();
+    };
+    window.addEventListener("keydown", escHandler);
 
     try {
-      const ex = await extractAll(targets, {
+      const ex = await extract(
+        targets,
         log,
-        source: (id, st) => setSourceStatus((s) => ({ ...s, [id]: st })),
-        module: (k, st) => setModuleStatus((s) => ({ ...s, [k]: st })),
-        shouldAbort: () => abortRef.current,
-      });
-      const total = performance.now() - startRef.current;
-      if (abortRef.current) {
-        log("✕ run aborted by operator — nothing fabricated, dossier withheld", "err");
+        ac.signal,
+        pastedText.trim() ? pastedText : undefined,
+        (id, state, mods) => {
+          setSourceStatus((s) => ({ ...s, [id]: state }));
+          if (mods.length) setModules((m) => ({ ...m, [id]: mods }));
+        },
+      );
+      window.removeEventListener("keydown", escHandler);
+
+      if (abortRef.current || ac.signal.aborted) {
+        log("✕ run aborted by operator — partial wire log retained", "err");
         setPhase("aborted");
         return;
       }
+
       setExtraction(ex);
-      const liveFields = ex.results.reduce((a, r) => a + r.stats.found + r.stats.derived, 0);
-      const okCount = ex.results.filter((r) => r.status === "ok" || r.status === "partial").length;
-      const failedCount = ex.results.filter((r) => r.status === "failed").length;
-      log(
-        `✔ wire work complete — ${liveFields} live fields from ${okCount}/${ex.results.filter((r) => r.status !== "off").length} source(s) in ${(total / 1000).toFixed(1)}s${failedCount ? ` · ${failedCount} failed (see dossier)` : ""}`,
-        failedCount && !okCount ? "err" : "ok",
-      );
+      const live = ex.results.reduce((a, r) => a + r.stats.found + r.stats.derived, 0);
+      log(`✔ extraction complete — ${live} live fields across ${ex.results.length} source(s) in ${(ex.ms / 1000).toFixed(1)}s`, "ok");
       setPhase("done");
       setTimeout(() => document.getElementById("dossier")?.scrollIntoView({ behavior: "smooth", block: "start" }), 350);
     } catch (e) {
-      log(`✕ fatal — ${(e as Error).message}`, "err");
-      setPhase("aborted");
+      window.removeEventListener("keydown", escHandler);
+      if (abortRef.current || ac.signal.aborted) {
+        log("✕ run aborted by operator — partial wire log retained", "err");
+        setPhase("aborted");
+      } else {
+        log(`✕ fatal — ${(e as Error).message}`, "err");
+        setPhase("aborted");
+      }
     }
   };
 
   const onExport = () => {
     if (!extraction) return;
-    const handles = [
-      parseLinkedinSlug(extraction.targets.linkedin) ?? "x",
-      parseGithubHandle(extraction.targets.github),
-      parseLeetcodeHandle(extraction.targets.leetcode),
-    ]
+    const handles = [extraction.targets.linkedin, extraction.targets.github, extraction.targets.leetcode]
       .filter(Boolean)
       .join("+");
-    const blob = new Blob([JSON.stringify(toExport(extraction), null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(toExportPayload(extraction), null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `sieve_live_${handles}.json`;
+    a.download = `sieve_live_${handles || "profile"}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
     showToast("extraction JSON downloaded — real fields only");
@@ -238,7 +232,7 @@ export default function App() {
       </header>
 
       <main className="relative z-10 max-w-6xl mx-auto px-5">
-        {/* masthead — left-aligned, not a hero trio */}
+        {/* masthead */}
         <section className="pt-12 pb-10 grid lg:grid-cols-[1.3fr_0.7fr] gap-8 items-end">
           <div>
             <p className="font-mono text-[11px] tracking-[0.22em] text-mint-400 mb-4 flex items-center gap-2">
@@ -251,15 +245,15 @@ export default function App() {
               <span className="text-fog-500">Zero invented fields.</span>
             </h1>
             <p className="mt-5 text-fog-500 max-w-xl leading-relaxed">
-              Paste the handles your candidate gives you. SIEVE pulls the LinkedIn public page through CORS relays and
-              parses what the wall allows, hits GitHub&apos;s official REST API, and queries LeetCode&apos;s public stats —
-              every field below is stamped with the exact HTTP request it came from.
+              Paste the handles your candidate gives you. SIEVE renders the LinkedIn public page through a reader and
+              CORS relays, parses whatever the wall allows, hits GitHub&apos;s official REST API, and queries
+              LeetCode&apos;s public stats — every field below is stamped with the exact HTTP request it came from.
             </p>
           </div>
           <dl className="border border-ink-700/70 bg-ink-900/40 p-5 grid grid-cols-3 gap-4 text-center">
             {[
               { k: "3", v: "live sources" },
-              { k: "3", v: "CORS relays" },
+              { k: "4", v: "fetch paths" },
               { k: "0", v: "fake fields" },
             ].map((s) => (
               <div key={s.v}>
@@ -271,12 +265,27 @@ export default function App() {
         </section>
 
         {/* console */}
-        <Console targets={targets} onTarget={(p) => setTargets((t) => ({ ...t, ...p }))} onRun={run} busy={phase === "running"} error={error} />
+        <Console
+          targets={targets}
+          onTarget={(p) => setTargets((t) => ({ ...t, ...p }))}
+          pastedText={pastedText}
+          onPastedText={setPastedText}
+          onRun={run}
+          busy={phase === "running"}
+          error={error}
+        />
 
         {/* pipeline */}
         {showPipeline && (
           <div className="mt-10 reveal">
-            <Pipeline sourceStatus={sourceStatus} moduleStatus={moduleStatus} logs={logs} elapsed={elapsedMs} phase={phase} />
+            <Pipeline
+              sourceStatus={sourceStatus}
+              modules={modules}
+              targets={targets}
+              logs={logs}
+              elapsedMs={elapsedMs}
+              phase={phase}
+            />
           </div>
         )}
 
@@ -285,7 +294,7 @@ export default function App() {
           <div className="mt-8 border border-ember-400/40 bg-ember-400/5 p-5 flex items-start gap-3 reveal in">
             <Icon name="warn" className="w-5 h-5 text-ember-400 shrink-0 mt-0.5" />
             <div>
-              <p className="font-display font-semibold text-ember-300">Run aborted</p>
+              <p className="font-display font-semibold text-ember-300">Run aborted or failed</p>
               <p className="text-sm text-fog-500 mt-1">
                 The wire log above shows how far the extraction got. Re-run when ready — nothing was cached or faked.
               </p>
@@ -339,7 +348,7 @@ export default function App() {
       <footer className="relative z-10 border-t border-ink-800/80 mt-8">
         <div className="max-w-6xl mx-auto px-5 py-5 flex flex-wrap items-center gap-x-6 gap-y-2 font-mono text-[10.5px] text-fog-600">
           <span className="text-fog-500">SIEVE · phase 01 build</span>
-          <span>runs 100% in your browser — requests go from you to LinkedIn / GitHub / LeetCode via public relays</span>
+          <span>runs 100% in your browser — requests go from you to LinkedIn / GitHub / LeetCode via public readers &amp; relays</span>
           <span className="ml-auto inline-flex items-center gap-1.5">
             <Icon name="shield" className="w-3.5 h-3.5 text-mint-400" />
             no field is ever synthesized

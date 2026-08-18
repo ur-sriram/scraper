@@ -1,28 +1,35 @@
+import { useState } from "react";
 import { Icon } from "./icons";
-import type { Targets } from "../lib/engine";
+import type { ExtractInput } from "../lib/engine";
 
 interface ConsoleProps {
-  targets: Targets;
-  onTarget: (patch: Partial<Targets>) => void;
+  targets: ExtractInput;
+  onTarget: (patch: Partial<ExtractInput>) => void;
+  pastedText: string;
+  onPastedText: (v: string) => void;
   onRun: () => void;
   busy: boolean;
   error: string | null;
 }
 
-const SUGGESTIONS: { key: keyof Targets; label: string; icon: string; samples: { v: string; hint: string }[] }[] = [
+const SOURCES: { key: keyof ExtractInput; label: string; icon: string; prefix: string; placeholder: string; samples: { v: string; hint: string }[] }[] = [
   {
     key: "linkedin",
     label: "LinkedIn profile",
     icon: "linkedin",
+    prefix: "in/",
+    placeholder: "https://www.linkedin.com/in/ur-sriram/  or just the slug",
     samples: [
+      { v: "ur-sriram", hint: "your test target" },
       { v: "williamhgates", hint: "public profile" },
-      { v: "jeffweiner08", hint: "public profile" },
     ],
   },
   {
     key: "github",
     label: "GitHub username",
     icon: "github",
+    prefix: "gh/",
+    placeholder: "username or github.com/username",
     samples: [
       { v: "gaearon", hint: "React core" },
       { v: "sindresorhus", hint: "900+ repos" },
@@ -32,6 +39,8 @@ const SUGGESTIONS: { key: keyof Targets; label: string; icon: string; samples: {
     key: "leetcode",
     label: "LeetCode username",
     icon: "leetcode",
+    prefix: "lc/",
+    placeholder: "username or leetcode.com/u/username",
     samples: [
       { v: "kamyu104", hint: "top rank" },
       { v: "lee215", hint: "top rank" },
@@ -39,8 +48,9 @@ const SUGGESTIONS: { key: keyof Targets; label: string; icon: string; samples: {
   },
 ];
 
-export function Console({ targets, onTarget, onRun, busy, error }: ConsoleProps) {
-  const filled = [targets.linkedin, targets.github, targets.leetcode].filter((t) => t.trim()).length;
+export function Console({ targets, onTarget, pastedText, onPastedText, onRun, busy, error }: ConsoleProps) {
+  const filled = [targets.linkedin, targets.github, targets.leetcode].filter((t) => (t ?? "").trim()).length;
+  const [pasteOpen, setPasteOpen] = useState(false);
 
   return (
     <section id="console" className="relative">
@@ -60,45 +70,37 @@ export function Console({ targets, onTarget, onRun, busy, error }: ConsoleProps)
               Point the extractor at real handles.
             </h2>
             <p className="text-fog-500 text-sm max-w-xl mb-6">
-              LinkedIn is fetched through public CORS relays (anonymous tier — expect an authwall), GitHub hits the
-              official REST API, LeetCode tries three public stats endpoints. Every value shown later comes from those
-              live responses — nothing is invented.
+              LinkedIn is fetched live (rendered page reader + public HTML via CORS relays), GitHub hits the official
+              REST API, LeetCode tries three public stats endpoints. Every value in the dossier below is parsed from
+              those wire responses — <span className="text-mint-300">nothing is generated or guessed</span>.
             </p>
 
             <div className="space-y-4">
-              {SUGGESTIONS.map((s) => (
+              {SOURCES.map((s) => (
                 <div key={s.key}>
                   <label htmlFor={`t-${s.key}`} className="flex items-center gap-2 font-mono text-[11px] tracking-[0.14em] text-fog-500 uppercase mb-1.5">
                     <Icon name={s.icon} className="w-3.5 h-3.5 text-mint-400" />
                     {s.label}
                     {s.key !== "linkedin" && <span className="text-fog-600 normal-case tracking-normal">· optional</span>}
                   </label>
-                  <div className="flex items-stretch gap-2">
-                    <div className="relative flex-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 font-mono text-fog-600 text-sm pointer-events-none">
-                        {s.key === "linkedin" ? "in/" : s.key === "github" ? "gh/" : "lc/"}
-                      </span>
-                      <input
-                        id={`t-${s.key}`}
-                        type="text"
-                        spellCheck={false}
-                        autoComplete="off"
-                        value={targets[s.key]}
-                        disabled={busy}
-                        onChange={(e) => onTarget({ [s.key]: e.target.value } as Partial<Targets>)}
-                        onKeyDown={(e) => e.key === "Enter" && !busy && onRun()}
-                        placeholder={
-                          s.key === "linkedin"
-                            ? "https://www.linkedin.com/in/your-slug/"
-                            : s.key === "github"
-                              ? "username or github.com/username"
-                              : "username or leetcode.com/u/username"
-                        }
-                        className={`w-full bg-ink-950/80 border text-fog-100 placeholder:text-fog-600 font-mono text-sm px-3 py-2.5 pl-11 outline-none transition-colors focus:border-mint-400/70 disabled:opacity-50 ${
-                          error && s.key === "linkedin" ? "border-blush-400/70" : "border-ink-600/70"
-                        }`}
-                      />
-                    </div>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 font-mono text-fog-600 text-sm pointer-events-none">
+                      {s.prefix}
+                    </span>
+                    <input
+                      id={`t-${s.key}`}
+                      type="text"
+                      spellCheck={false}
+                      autoComplete="off"
+                      value={targets[s.key] ?? ""}
+                      disabled={busy}
+                      onChange={(e) => onTarget({ [s.key]: e.target.value } as Partial<ExtractInput>)}
+                      onKeyDown={(e) => e.key === "Enter" && !busy && onRun()}
+                      placeholder={s.placeholder}
+                      className={`w-full bg-ink-950/80 border text-fog-100 placeholder:text-fog-600 font-mono text-sm px-3 py-2.5 pl-11 outline-none transition-colors focus:border-mint-400/70 disabled:opacity-50 ${
+                        error && s.key === "linkedin" ? "border-blush-400/70" : "border-ink-600/70"
+                      }`}
+                    />
                   </div>
                   <div className="flex flex-wrap gap-1.5 mt-2">
                     <span className="font-mono text-[10px] text-fog-600 self-center mr-1">try:</span>
@@ -107,7 +109,7 @@ export function Console({ targets, onTarget, onRun, busy, error }: ConsoleProps)
                         key={sm.v}
                         type="button"
                         disabled={busy}
-                        onClick={() => onTarget({ [s.key]: sm.v } as Partial<Targets>)}
+                        onClick={() => onTarget({ [s.key]: sm.v } as Partial<ExtractInput>)}
                         className="group font-mono text-[11px] px-2 py-0.5 border border-ink-600/70 text-fog-300 hover:border-mint-400/60 hover:text-mint-300 transition-colors disabled:opacity-40"
                         title={sm.hint}
                       >
@@ -118,6 +120,44 @@ export function Console({ targets, onTarget, onRun, busy, error }: ConsoleProps)
                   </div>
                 </div>
               ))}
+            </div>
+
+            {/* paste fallback */}
+            <div className="mt-5 border border-ink-700/70 bg-ink-950/40">
+              <button
+                type="button"
+                onClick={() => setPasteOpen((o) => !o)}
+                className="w-full flex items-center justify-between px-4 py-2.5 text-left group"
+              >
+                <span className="flex items-center gap-2 font-mono text-[11px] tracking-[0.14em] text-fog-500 uppercase group-hover:text-fog-300 transition-colors">
+                  <Icon name="terminal" className="w-3.5 h-3.5 text-ember-400" />
+                  authwall bypass — paste the profile text
+                </span>
+                <span className={`font-mono text-fog-600 transition-transform ${pasteOpen ? "rotate-90" : ""}`}>›</span>
+              </button>
+              {pasteOpen && (
+                <div className="px-4 pb-4">
+                  <p className="text-xs text-fog-500 leading-relaxed mb-2">
+                    If LinkedIn's authwall blocks the anonymous fetch, open the profile while signed in, select-all the
+                    page text (or copy the rendered markdown), and paste it here. The extractor parses it locally with
+                    the same field rules — <span className="text-ember-300">still your real data, never synthetic</span>.
+                  </p>
+                  <textarea
+                    value={pastedText}
+                    onChange={(e) => onPastedText(e.target.value)}
+                    disabled={busy}
+                    rows={5}
+                    spellCheck={false}
+                    placeholder="Paste the LinkedIn profile text / page source here…"
+                    className="w-full bg-ink-950/80 border border-ink-600/70 text-fog-100 placeholder:text-fog-600 font-mono text-xs px-3 py-2.5 outline-none focus:border-ember-400/60 disabled:opacity-50 resize-y"
+                  />
+                  {pastedText.trim() && (
+                    <p className="mt-1.5 font-mono text-[10px] text-ember-300">
+                      {(pastedText.length / 1024).toFixed(1)} KB staged — will be used for the LinkedIn module
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
 
             {error && (
@@ -157,10 +197,10 @@ export function Console({ targets, onTarget, onRun, busy, error }: ConsoleProps)
             </div>
             <dl className="space-y-3 text-sm">
               {[
-                { k: "engine", v: "sieve live-extract v2", mono: true },
-                { k: "linkedin path", v: "public page → 3 CORS relays → DOMParser", mono: true },
+                { k: "engine", v: "sieve live-extract v2.1", mono: true },
+                { k: "linkedin path", v: "jina reader + 3 CORS relays → parser", mono: true },
                 { k: "github path", v: "api.github.com (direct, CORS-enabled)", mono: true },
-                { k: "leetcode path", v: "stats API → wrapper → GraphQL relay", mono: true },
+                { k: "leetcode path", v: "stats API → wrapper → GraphQL", mono: true },
                 { k: "auth tier", v: "Phase 01.5 · maxun-core + session cookie", mono: false },
               ].map((r) => (
                 <div key={r.k} className="flex items-baseline justify-between gap-3 border-b border-ink-800/80 pb-2.5">
@@ -172,14 +212,15 @@ export function Console({ targets, onTarget, onRun, busy, error }: ConsoleProps)
 
             <div className="mt-6 border border-ember-400/30 bg-ember-400/5 p-4">
               <div className="flex items-center gap-2 mb-2">
-                <Icon name="lock" className="w-4 h-4 text-ember-400" />
+                <Icon name="shield" className="w-4 h-4 text-ember-400" />
                 <span className="font-display text-sm font-semibold text-ember-300">The honest bit</span>
               </div>
               <p className="text-xs leading-relaxed text-fog-500">
-                LinkedIn serves anonymous browsers an <span className="text-ember-300 font-mono">authwall</span> — so
-                the live tier gets what the wall allows (name, headline, About excerpt, photo). Fields it locks are
-                reported as <span className="font-mono text-ember-300">AUTH</span>, never faked. GitHub &amp; LeetCode
-                are fully open APIs — that data is 100% live.
+                LinkedIn serves anonymous browsers an <span className="text-ember-300 font-mono">authwall</span>. The
+                live tier extracts whatever the public shell exposes — name, headline, About, photo, and any public
+                Experience / Education / Skills sections. What the wall locks is reported as{" "}
+                <span className="font-mono text-ember-300">AUTH</span>, never invented. GitHub &amp; LeetCode are open
+                APIs — that data is 100% live. Paste the profile text to unlock the rest without a backend.
               </p>
             </div>
           </aside>
