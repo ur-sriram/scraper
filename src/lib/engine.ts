@@ -41,6 +41,14 @@ export interface Trace {
   ok: boolean;
 }
 
+export interface TierOutcome {
+  tier: string; // L0..L6
+  name: string;
+  status: "hit" | "miss" | "skip";
+  detail: string;
+  fields: number;
+}
+
 export interface SourceResult {
   id: "linkedin" | "github" | "leetcode";
   label: string;
@@ -50,6 +58,7 @@ export interface SourceResult {
   avatar?: string;
   modules: ModuleData[];
   traces: Trace[];
+  tiers?: TierOutcome[];
   stats: { found: number; derived: number; missing: number; auth: number; error: number };
   error?: string;
 }
@@ -180,6 +189,7 @@ async function fetchText(target: string, parent: AbortSignal | undefined, log: L
 /*  date helpers                                                       */
 /* ------------------------------------------------------------------ */
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const MONTHS_RE = /(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)/i;
 const MONTH_IDX: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 
@@ -479,6 +489,7 @@ interface LiHarvest {
   externalLinks: { text: string; href: string }[];
   openToWork: boolean;
   aboutMeta: string | null;
+  voyager?: VoyagerData;
 }
 
 function emptyHarvest(via: string): LiHarvest {
@@ -1245,73 +1256,677 @@ async function extractLeetcode(handle: string, parent: AbortSignal | undefined, 
 }
 
 /* ------------------------------------------------------------------ */
-/*  LinkedIn extraction orchestrator (jina → relays → merge)           */
+/*  LOO PHOLE LADDER — L0 paste · L1 voyager <code> blobs · L2 DOM     */
+/*  L3 reader markdown · L4 og/meta/ld+json · L5 Wayback · L6 search   */
+/* ------------------------------------------------------------------ */
+
+const EMPTYPE: Record<string, string> = {
+  FULL_TIME: "Full-time", PART_TIME: "Part-time", CONTRACT: "Contract", INTERNSHIP: "Internship",
+  SELF_EMPLOYED: "Self-employed", FREELANCE: "Freelance", SEASONAL: "Seasonal",
+};
+
+interface VoyagerEntry { title: string; company?: string; type?: string; range?: string; duration?: string; loc?: string; desc?: string; skills?: string[]; }
+interface VoyagerEdu { school: string; degree?: string; field?: string; range?: string; grade?: string; activities?: string; }
+interface VoyagerCert { name: string; issuer?: string; issued?: string; expires?: string; credId?: string; url?: string; skills?: string[]; }
+interface VoyagerData {
+  firstName?: string; lastName?: string; headline?: string; summary?: string;
+  locationName?: string; industryName?: string; openToWork?: boolean; photo?: string;
+  positions: VoyagerEntry[]; educations: VoyagerEdu[]; skills: { name: string; endorsements?: number }[];
+  certs: VoyagerCert[]; projects: { name: string; desc?: string; url?: string; range?: string }[];
+  honors: { name: string; issuer?: string; date?: string; desc?: string }[];
+  publications: { name: string; publisher?: string; date?: string; url?: string }[];
+  patents: { name: string; number?: string; date?: string }[];
+  organizations: string[]; volunteer: { role: string; org?: string; range?: string; cause?: string; desc?: string }[];
+  languages: string[]; courses: string[]; testScores: { name: string; score?: string; date?: string }[];
+  recommendations: { text?: string; author?: string }[];
+  websites: string[];
+}
+
+function timeRange(tp: any): string | null {
+  if (!tp || !tp.startDate) return null;
+  const s = `${tp.startDate.month ? MONTHS[tp.startDate.month - 1] + " " : ""}${tp.startDate.year}`;
+  const e = tp.endDate ? `${tp.endDate.month ? MONTHS[tp.endDate.month - 1] + " " : ""}${tp.endDate.year}` : "Present";
+  return `${s} - ${e}`;
+}
+
+function walk(o: any, fn: (o: any) => void, depth = 0): void {
+  if (!o || typeof o !== "object" || depth > 16) return;
+  fn(o);
+  if (Array.isArray(o)) o.forEach((x) => walk(x, fn, depth + 1));
+  else for (const k of Object.keys(o)) walk(o[k], fn, depth + 1);
+}
+
+/* L1 — the crown jewel: LinkedIn preloads full Voyager API responses as
+   HTML-escaped JSON inside hidden <code id="bpr-guid-*"> tags. Recover them. */
+function parseVoyagerBlobs(doc: Document): VoyagerData | null {
+  const blobs: any[] = [];
+  doc.querySelectorAll("code, script[type='application/json']").forEach((el) => {
+    let raw = el.innerHTML ?? "";
+    if (raw.length < 400 || raw.length > 4_000_000) return;
+    raw = raw.replace(/^\s*<!--/, "").replace(/-->\s*$/, "").trim();
+    if (!(raw.startsWith("{") || raw.startsWith("["))) return;
+    const decoded = new DOMParser().parseFromString(raw, "text/html").body.textContent ?? raw;
+    try {
+      blobs.push(JSON.parse(decoded));
+    } catch {
+      /* not a JSON blob */
+    }
+  });
+  if (!blobs.length) return null;
+
+  const v: VoyagerData = {
+    positions: [], educations: [], skills: [], certs: [], projects: [], honors: [], publications: [],
+    patents: [], organizations: [], volunteer: [], languages: [], courses: [], testScores: [],
+    recommendations: [], websites: [],
+  };
+  const take = (view: any, push: (el: any) => void) => {
+    if (view && Array.isArray(view.elements)) view.elements.forEach(push);
+  };
+  const normPos = (p: any): VoyagerEntry => {
+    const r = timeRange(p.timePeriod);
+    return {
+      title: p.title,
+      company: p.companyName ?? p.company?.name ?? p.company?.localizedName ?? undefined,
+      type: p.employmentType ? EMPTYPE[String(p.employmentType)] ?? String(p.employmentType) : undefined,
+      range: r ?? undefined,
+      duration: r ? durationFromRange(r) ?? undefined : undefined,
+      loc: p.locationName ?? undefined,
+      desc: typeof p.description === "string" ? p.description : undefined,
+      skills: Array.isArray(p.skills) ? p.skills.map((s: any) => s?.name).filter(Boolean) : undefined,
+    };
+  };
+
+  for (const j of blobs) {
+    walk(j, (o) => {
+      if (!v.firstName && typeof o.firstName === "string" && typeof o.lastName === "string") {
+        v.firstName = o.firstName;
+        v.lastName = o.lastName;
+        if (typeof o.headline === "string") v.headline = o.headline;
+        if (typeof o.summary === "string" && o.summary.length > 20) v.summary = o.summary;
+        if (typeof o.locationName === "string") v.locationName = o.locationName;
+        if (typeof o.industryName === "string") v.industryName = o.industryName;
+        if (o.openToWork === true) v.openToWork = true;
+        const pic =
+          typeof o.profilePictureOriginalImage === "string" ? o.profilePictureOriginalImage
+          : typeof o.profilePicture?.displayImage === "string" ? o.profilePicture.displayImage : null;
+        if (pic) v.photo = pic;
+      }
+      take(o.positionView, (p) => { if (p?.title) v.positions.push(normPos(p)); });
+      take(o.educationView, (e) => {
+        if (e?.schoolName) {
+          const r = timeRange(e.timePeriod);
+          v.educations.push({ school: e.schoolName, degree: e.degreeName ?? undefined, field: e.fieldOfStudy ?? undefined, range: r ?? undefined, grade: typeof e.grade === "string" ? e.grade : undefined, activities: typeof e.activities === "string" ? e.activities : undefined });
+        }
+      });
+      take(o.certificationView, (c) => {
+        if (c?.name) {
+          v.certs.push({
+            name: c.name,
+            issuer: c.companyName ?? c.issuerName ?? c.issuer?.name ?? undefined,
+            issued: c.timePeriod?.startDate ? `${c.timePeriod.startDate.month ? MONTHS[c.timePeriod.startDate.month - 1] + " " : ""}${c.timePeriod.startDate.year}` : undefined,
+            expires: c.timePeriod?.endDate ? `${c.timePeriod.endDate.month ? MONTHS[c.timePeriod.endDate.month - 1] + " " : ""}${c.timePeriod.endDate.year}` : c.expired === false ? "No expiration" : undefined,
+            credId: typeof c.credentialId === "string" ? c.credentialId : undefined,
+            url: typeof c.credentialUrl === "string" ? c.credentialUrl : undefined,
+            skills: Array.isArray(c.skills) ? c.skills.map((s: any) => s?.name).filter(Boolean) : undefined,
+          });
+        }
+      });
+      take(o.projectView, (p) => { if (p?.title || p?.name) v.projects.push({ name: p.title ?? p.name, desc: p.description, url: p.url, range: timeRange(p.timePeriod) ?? undefined }); });
+      take(o.honorView, (hh) => {
+        if (hh?.title || hh?.name) v.honors.push({ name: hh.title ?? hh.name, issuer: hh.issuer ?? hh.issuerName, date: timeRange(hh.timePeriod) ?? (hh.issueDate ? `${hh.issueDate.month ? MONTHS[hh.issueDate.month - 1] + " " : ""}${hh.issueDate.year}` : undefined), desc: hh.description });
+      });
+      take(o.publicationView, (p) => { if (p?.title || p?.name) v.publications.push({ name: p.title ?? p.name, publisher: p.publisher, date: timeRange(p.timePeriod) ?? undefined, url: p.url }); });
+      take(o.patentView, (p) => { if (p?.title || p?.name) v.patents.push({ name: p.title ?? p.name, number: p.number, date: timeRange(p.timePeriod) ?? undefined }); });
+      take(o.organizationView, (g) => { if (g?.name) v.organizations.push(g.name); });
+      take(o.volunteerView, (x) => { if (x?.role || x?.title) v.volunteer.push({ role: x.role ?? x.title, org: x.companyName ?? x.organizationName, range: timeRange(x.timePeriod) ?? undefined, cause: x.cause, desc: x.description }); });
+      take(o.languageView, (l) => { if (l?.name) v.languages.push(l.proficiency ? `${l.name} (${l.proficiency})` : l.name); });
+      take(o.courseView, (c) => { if (c?.name || c?.title) v.courses.push(c.name ?? c.title); });
+      take(o.testScoreView, (t) => { if (t?.name || t?.title) v.testScores.push({ name: t.name ?? t.title, score: typeof t.score === "string" ? t.score : undefined, date: timeRange(t.timePeriod) ?? undefined }); });
+      take(o.recommendationReceivedView, (r) => {
+        if (r?.text) v.recommendations.push({ text: r.text, author: r.recommender ? `${r.recommender.firstName ?? ""} ${r.recommender.lastName ?? ""}`.trim() + (r.recommender.headline ? `, ${r.recommender.headline}` : "") : undefined });
+      });
+      if (o.skillCategories && Array.isArray(o.skillCategories.elements)) {
+        for (const cat of o.skillCategories.elements) for (const s of cat.skills ?? []) if (s?.name) v.skills.push({ name: s.name, endorsements: typeof s.endorsementCount === "number" ? s.endorsementCount : undefined });
+      }
+      if (Array.isArray(o.skills)) for (const s of o.skills) if (s?.name && !v.skills.some((x) => x.name === s.name)) v.skills.push({ name: s.name, endorsements: typeof s.endorsementCount === "number" ? s.endorsementCount : undefined });
+      if (Array.isArray(o.websites)) for (const w of o.websites) if (w?.url) v.websites.push(w.url);
+    });
+  }
+
+  const seen = new Set<string>();
+  v.skills = v.skills.filter((s) => (seen.has(s.name) ? false : (seen.add(s.name), true))).slice(0, 60);
+  v.positions = v.positions.slice(0, 12);
+  v.educations = v.educations.slice(0, 6);
+  return voyagerScore(v) > 0 ? v : null;
+}
+
+function voyagerScore(v: VoyagerData): number {
+  let s = 0;
+  s += v.firstName ? 1 : 0; s += v.headline ? 1 : 0; s += v.summary ? 1 : 0; s += v.locationName ? 1 : 0; s += v.industryName ? 1 : 0;
+  s += v.positions.length ? 1 : 0; s += v.educations.length ? 1 : 0; s += v.skills.length ? 1 : 0;
+  s += v.certs.length ? 1 : 0; s += v.projects.length ? 1 : 0; s += v.honors.length ? 1 : 0;
+  s += v.publications.length ? 1 : 0; s += v.patents.length ? 1 : 0; s += v.organizations.length ? 1 : 0;
+  s += v.volunteer.length ? 1 : 0; s += v.languages.length ? 1 : 0; s += v.recommendations.length ? 1 : 0;
+  s += v.websites.length ? 1 : 0;
+  return s;
+}
+
+function voyagerDetail(v: VoyagerData): string {
+  const bits = [
+    v.firstName ? "core profile" : null,
+    v.positions.length ? `${v.positions.length} roles` : null,
+    v.skills.length ? `${v.skills.length} skills` : null,
+    v.educations.length ? `${v.educations.length} edu` : null,
+    v.certs.length ? `${v.certs.length} certs` : null,
+    v.recommendations.length ? `${v.recommendations.length} recs` : null,
+  ].filter(Boolean);
+  return bits.join(" · ") || "empty payload";
+}
+
+function classifyExt(href: string): { label: string; conf: number } | null {
+  if (/github\.com\//.test(href)) return { label: "GitHub", conf: 0.95 };
+  if (/leetcode\.com\//.test(href)) return { label: "LeetCode", conf: 0.92 };
+  if (/kaggle\.com\//.test(href)) return { label: "Kaggle", conf: 0.9 };
+  if (/stackoverflow\.com\/users\//.test(href)) return { label: "Stack Overflow", conf: 0.9 };
+  if (/scholar\.google\.com|researchgate\.net|orcid\.org/.test(href)) return { label: "Research Profile", conf: 0.88 };
+  if (/x\.com\/|twitter\.com\//.test(href)) return { label: "X / Twitter", conf: 0.9 };
+  if (/medium\.com|dev\.to|hashnode/.test(href)) return { label: "Blog", conf: 0.85 };
+  if (/youtube\.com|youtu\.be/.test(href)) return { label: "YouTube", conf: 0.85 };
+  if (/^https?:\/\//.test(href) && !/linkedin\.com|licdn\.com|google\./.test(href)) return { label: "Personal Site", conf: 0.8 };
+  return null;
+}
+
+/* L1 module builder — fields straight out of the Voyager JSON blobs */
+function buildFromVoyager(v: VoyagerData, slug: string, url: string): ModuleData[] {
+  const L1 = (sel: string) => `[L1] voyager <code> blob → ${sel}`;
+  const mods: ModuleData[] = [];
+
+  const identity: Field[] = [];
+  identity.push(found("Full Name", "text", `${v.firstName} ${v.lastName}`.trim(), L1("profile.firstName / lastName"), 0.98));
+  if (v.headline) identity.push(found("Headline", "text", v.headline, L1("profile.headline"), 0.97));
+  if (v.summary) identity.push(found("About / Bio", "text", v.summary, L1("profile.summary"), 0.96));
+  if (v.locationName) {
+    identity.push(found("Location", "text", v.locationName, L1("profile.locationName"), 0.96));
+    const parts = v.locationName.split(",").map((x) => x.trim());
+    if (parts.length >= 2) {
+      identity.push(found("Country", "text", parts[parts.length - 1], L1("locationName (derived)"), 0.85));
+      identity.push(found("City", "text", parts[0], L1("locationName (derived)"), 0.85));
+    }
+  }
+  if (v.positions.length) {
+    identity.push(found("Current Role", "text", v.positions[0].title, L1("positionView[0].title"), 0.95));
+    if (v.positions[0].company) identity.push(found("Current Company", "text", v.positions[0].company, L1("positionView[0].companyName"), 0.93));
+  }
+  if (v.industryName) identity.push(found("Industry", "text", v.industryName, L1("profile.industryName"), 0.93));
+  if (v.languages.length) identity.push(found("Languages", "chips", v.languages, L1("languageView"), 0.9));
+  identity.push(found("Profile URL", "link", url, "canonical URL (constructed)", 0.99));
+  mods.push({ id: "identity", name: "Identity & Basics", icon: "fingerprint", summary: "full Voyager profile object recovered", fields: identity });
+
+  mods.push({
+    id: "experience", name: "Experience", icon: "briefcase",
+    summary: `${v.positions.length} roles from positionView`,
+    fields: [],
+    entries: v.positions.length ? v.positions.map((p) => {
+      const fs: Field[] = [];
+      if (p.company) fs.push(found("Company", "text", p.company, L1("positionView[i].companyName"), 0.95));
+      if (p.type) fs.push(found("Employment Type", "text", p.type, L1("positionView[i].employmentType"), 0.93));
+      if (p.range) {
+        const parts = p.range.split(" - ");
+        fs.push(found("Start Date", "text", parts[0], L1("timePeriod.startDate"), 0.95));
+        fs.push(found("End Date", "text", parts[1] ?? "Present", L1("timePeriod.endDate"), 0.95));
+      }
+      if (p.duration) { const f = found("Duration", "text", p.duration, L1("timePeriod (derived)"), 0.88); f.status = "derived"; fs.push(f); }
+      if (p.loc) fs.push(found("Role Location", "text", p.loc, L1("positionView[i].locationName"), 0.9));
+      if (p.desc) fs.push(found("Job Description", "text", p.desc.slice(0, 900), L1("positionView[i].description"), 0.92));
+      if (p.skills?.length) fs.push(found("Technologies Used", "chips", p.skills, L1("positionView[i].skills"), 0.88));
+      return { title: p.title, subtitle: [p.company, p.type].filter(Boolean).join(" · "), meta: p.range, fields: fs };
+    }) : undefined,
+  });
+
+  const skillFields: Field[] = [];
+  if (v.skills.length) {
+    skillFields.push(found("Skills (profile list)", "chips", v.skills.map((s) => s.name), L1("skillCategories / skills"), 0.95));
+    const withEnd = v.skills.filter((s) => s.endorsements != null).slice(0, 8);
+    if (withEnd.length) skillFields.push(found("Endorsements", "lines", withEnd.map((s) => `${s.name} — ${s.endorsements} endorsements`), L1("skills[i].endorsementCount"), 0.9));
+  }
+  mods.push({ id: "skills", name: "Skills", icon: "chip", summary: v.skills.length ? `${v.skills.length} skills with endorsement counts` : "skill views empty", fields: skillFields.length ? skillFields : [missingField("Skills", L1("skillCategories"), "No skills in the recovered payload.")] });
+
+  mods.push({
+    id: "education", name: "Education", icon: "cap",
+    summary: v.educations.length ? `${v.educations.length} institution${v.educations.length > 1 ? "s" : ""} from educationView` : "education view empty",
+    fields: v.educations.length ? [] : [missingField("Education", L1("educationView"), "No education entries in the recovered payload.")],
+    entries: v.educations.map((e) => {
+      const fs: Field[] = [];
+      if (e.degree) fs.push(found("Degree", "text", e.degree, L1("educationView[i].degreeName"), 0.94));
+      if (e.field) fs.push(found("Field of Study", "text", e.field, L1("educationView[i].fieldOfStudy"), 0.94));
+      if (e.range) {
+        const ys = e.range.match(/\d{4}/g);
+        if (ys) {
+          fs.push(found("Start Year", "text", ys[0], L1("timePeriod.startDate"), 0.9));
+          fs.push(found("Graduation Year", "text", /present/i.test(e.range) ? "Present" : ys[ys.length - 1], L1("timePeriod.endDate"), 0.9));
+        }
+      }
+      if (e.grade) fs.push(found("GPA / Grade", "text", e.grade, L1("educationView[i].grade"), 0.9));
+      if (e.activities) fs.push(found("Activities", "text", e.activities, L1("educationView[i].activities"), 0.88));
+      return { title: e.school, subtitle: [e.degree, e.field].filter(Boolean).join(" · "), meta: e.range, fields: fs };
+    }),
+  });
+
+  mods.push({
+    id: "projects", name: "Projects", icon: "rocket",
+    summary: v.projects.length ? `${v.projects.length} projects from projectView` : "project view empty",
+    fields: v.projects.length ? [] : [missingField("Projects", L1("projectView"), "No projects in the recovered payload (GitHub tab covers repos live).")],
+    entries: v.projects.map((p) => {
+      const fs: Field[] = [];
+      if (p.desc) fs.push(found("Description", "text", p.desc.slice(0, 600), L1("projectView[i].description"), 0.9));
+      if (p.range) fs.push(found("Project Duration", "text", p.range, L1("projectView[i].timePeriod"), 0.85));
+      if (p.url) fs.push(found("Link", "link", p.url, L1("projectView[i].url"), 0.93));
+      return { title: p.name, fields: fs };
+    }),
+  });
+
+  const ach: Field[] = [];
+  if (v.honors.length) ach.push(found("Honors & Awards", "lines", v.honors.map((h) => [h.name, h.issuer, h.date].filter(Boolean).join(" — ")), L1("honorView"), 0.92));
+  if (v.publications.length) ach.push(found("Publications", "lines", v.publications.map((p) => [p.name, p.publisher, p.date].filter(Boolean).join(" — ")), L1("publicationView"), 0.9));
+  if (v.patents.length) ach.push(found("Patents", "lines", v.patents.map((p) => [p.name, p.number, p.date].filter(Boolean).join(" — ")), L1("patentView"), 0.9));
+  if (v.courses.length) ach.push(found("Courses", "chips", v.courses, L1("courseView"), 0.88));
+  if (v.testScores.length) ach.push(found("Test Scores", "lines", v.testScores.map((t) => [t.name, t.score, t.date].filter(Boolean).join(" — ")), L1("testScoreView"), 0.88));
+  if (!ach.length) ach.push(missingField("Achievements", L1("honorView / publicationView"), "No accomplishment views in the recovered payload."));
+  mods.push({ id: "achievements", name: "Achievements", icon: "trophy", summary: `${v.honors.length} honors · ${v.publications.length} publications · ${v.patents.length} patents`, fields: ach });
+
+  mods.push({
+    id: "certifications", name: "Certifications", icon: "ribbon",
+    summary: v.certs.length ? `${v.certs.length} credentials from certificationView` : "certification view empty",
+    fields: v.certs.length ? [] : [missingField("Certifications", L1("certificationView"), "No certifications in the recovered payload.")],
+    entries: v.certs.map((c) => {
+      const fs: Field[] = [];
+      if (c.issuer) fs.push(found("Issuing Organization", "text", c.issuer, L1("certificationView[i].companyName"), 0.93));
+      if (c.issued) fs.push(found("Issue Date", "text", c.issued, L1("timePeriod.startDate"), 0.93));
+      if (c.expires) fs.push(found("Expiry Date", "text", c.expires, L1("timePeriod.endDate / expired"), 0.9));
+      if (c.credId) fs.push(found("Credential ID", "text", c.credId, L1("certificationView[i].credentialId"), 0.95));
+      if (c.url) fs.push(found("Credential URL", "link", c.url, L1("certificationView[i].credentialUrl"), 0.93));
+      if (c.skills?.length) fs.push(found("Skills Covered", "chips", c.skills, L1("certificationView[i].skills"), 0.88));
+      return { title: c.name, subtitle: c.issuer, fields: fs };
+    }),
+  });
+
+  const sig: Field[] = [];
+  if (v.openToWork) sig.push(found("Open to Work", "text", "Yes — openToWork flag is true in the profile object", L1("profile.openToWork"), 0.95));
+  else sig.push(missingField("Open to Work", L1("profile.openToWork"), "Flag absent or false in the recovered payload."));
+  for (const [label, sel] of [["Preferred Job Titles", "pv-open-to-work.jobTitles"], ["Preferred Locations", "pv-open-to-work.locations"], ["Remote Preference", "careerPreferences.remote"], ["Employment Type", "careerPreferences.types"], ["Industries Interested In", "careerPreferences.industries"]] as [string, string][]) {
+    sig.push(authField(label, `[L1] ${sel}`));
+  }
+  mods.push({ id: "signals", name: "Professional Signals", icon: "radar", summary: v.openToWork ? "openToWork flag recovered" : "career preferences are recruiter-only", fields: sig });
+
+  const net: Field[] = [];
+  if (v.organizations.length) net.push(found("Organizations", "chips", v.organizations, L1("organizationView"), 0.9));
+  if (v.volunteer.length) net.push(found("Volunteer Experience", "lines", v.volunteer.map((x) => [x.role, x.org, x.range].filter(Boolean).join(" — ")), L1("volunteerView"), 0.88));
+  if (v.recommendations.length) net.push(found("Recommendations Received", "lines", v.recommendations.map((r) => `“${(r.text ?? "").slice(0, 220)}${(r.text ?? "").length > 220 ? "…" : ""}”${r.author ? ` — ${r.author}` : ""}`), L1("recommendationReceivedView"), 0.9));
+  if (!net.length) net.push(missingField("Network", L1("organizationView / volunteerView"), "No network views in the recovered payload."));
+  mods.push({ id: "network", name: "Network", icon: "nodes", summary: `${v.volunteer.length} volunteer · ${v.recommendations.length} recommendations`, fields: net });
+
+  mods.push({
+    id: "content", name: "Content & Activity", icon: "pen",
+    summary: "activity feed needs a session",
+    fields: [authField("Posts / Articles / Activity", "[L1] activity feed is session-only")],
+  });
+
+  const ext: Field[] = [];
+  const seen = new Set<string>();
+  for (const href of v.websites) {
+    const c = classifyExt(href);
+    if (c && !seen.has(c.label)) { seen.add(c.label); ext.push(found(c.label, "link", href, L1("profile.websites"), c.conf)); }
+  }
+  for (const w of ["GitHub", "LeetCode", "Portfolio", "Personal Site", "Kaggle", "Stack Overflow", "Research Profile"]) {
+    if (!ext.some((e) => e.label === w)) ext.push(missingField(w, L1("profile.websites"), `No ${w} link in the recovered payload.`));
+  }
+  mods.push({ id: "external", name: "External Profiles", icon: "orbit", summary: `${ext.filter((e) => e.status === "found").length} links from profile.websites`, fields: ext });
+
+  void slug;
+  return mods;
+}
+
+const countStatus = (m: ModuleData, st: FieldStatus[]) =>
+  [...m.fields, ...(m.entries ?? []).flatMap((e) => e.fields)].filter((f) => st.includes(f.status)).length;
+
+function overlayVoyager(base: ModuleData[], v: VoyagerData, slug: string, url: string): ModuleData[] {
+  const vv = buildFromVoyager(v, slug, url);
+  return base.map((bm) => {
+    const vm = vv.find((x) => x.id === bm.id);
+    if (!vm) return bm;
+    const vFound = countStatus(vm, ["found", "derived"]);
+    const bFound = countStatus(bm, ["found", "derived"]);
+    return (vm.entries?.length ?? 0) > 0 || vFound > bFound ? vm : bm;
+  });
+}
+
+/* L2 — Jina can hand back the fully rendered DOM (X-Return-Format: html);
+   parse it with LinkedIn's own public-page class names. */
+async function fetchJinaHtml(targetUrl: string, parent: AbortSignal | undefined, log: LogSink): Promise<{ html: string; trace: Trace }> {
+  const t0 = performance.now();
+  const url = `https://r.jina.ai/${targetUrl}`;
+  log(`GET ${targetUrl.replace("https://", "")} → via jina-reader (X-Return-Format: html) …`, "dim");
+  try {
+    const res = await fetchWithTimeout(url, parent, 30000, { headers: { Accept: "application/json", "X-Return-Format": "html" } });
+    const txt = await res.text();
+    const ms = Math.round(performance.now() - t0);
+    const trace: Trace = { via: "jina-html", url, status: res.status, bytes: txt.length, ms, ok: res.ok };
+    if (!res.ok) {
+      log(`✗ jina-html → HTTP ${res.status} · ${ms} ms`, "warn");
+      return { html: "", trace };
+    }
+    let html = "";
+    try {
+      const j = JSON.parse(txt);
+      html = j?.data?.content ?? "";
+    } catch {
+      html = txt;
+    }
+    log(`✓ jina-html → 200 · ${(html.length / 1024).toFixed(1)} KB rendered DOM · ${ms} ms`, "ok");
+    return { html, trace: { ...trace, bytes: html.length } };
+  } catch (e) {
+    if (parent?.aborted) throw e;
+    log(`✗ jina-html → ${(e as Error).name} · ${Math.round(performance.now() - t0)} ms`, "warn");
+    return { html: "", trace: { via: "jina-html", url, status: "ERR", bytes: 0, ms: Math.round(performance.now() - t0), ok: false } };
+  }
+}
+
+function parseRenderedDom(html: string): Partial<LiHarvest> {
+  const p: Partial<LiHarvest> = {
+    expEntries: [], expMeta: [], eduEntries: [], eduMeta: [], skills: [], projEntries: [], certEntries: [],
+    honorEntries: [], volunteerEntries: [], recommendations: [], activity: [], organizations: [],
+    publications: [], patents: [], languages: [], externalLinks: [], about: [], via: "jina-html",
+  };
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  if (/(authwall|Sign Up \| LinkedIn)/i.test(doc.title) || doc.querySelector("section.authentication__content")) return p;
+
+  const txt = (sels: string[]): string => {
+    for (const s of sels) {
+      const el = doc.querySelector(s);
+      const t = el?.textContent?.replace(/\s+/g, " ").trim();
+      if (t) return t;
+    }
+    return "";
+  };
+
+  p.name = txt(["h1.top-card-layout__title", "h1.text-heading-xlarge", "h1"]) || undefined;
+  p.headline = txt([".top-card-layout__headline", "h2.top-card-layout__headline", ".text-body-medium"]) || undefined;
+  p.location = txt([".top-card-layout__location", "span.text-body-small.pb2"]) || undefined;
+  const aboutEl = doc.querySelector("#about") ?? doc.querySelector("section[aria-label='About']");
+  if (aboutEl) {
+    const t = (aboutEl.textContent ?? "").replace(/\s+/g, " ").replace(/^about\s*/i, "").trim();
+    if (t.length > 40) p.about = [t.slice(0, 1800)];
+  }
+
+  const items = Array.from(doc.querySelectorAll(".experience-item, section#experience li"));
+  for (const it of items.slice(0, 12)) {
+    const title = it.querySelector(".experience-item__title")?.textContent?.trim() ?? "";
+    const sub = it.querySelector(".experience-item__subtitle")?.textContent?.trim() ?? "";
+    const dates = it.querySelector(".experience-item__date-range")?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    const desc = it.querySelector(".experience-item__description")?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    if (!title) continue;
+    const [company, type] = sub.split("·").map((x) => x.trim());
+    const dur = dates ? durationFromRange(dates) : null;
+    const srcBase = `[L2] rendered DOM → Experience “${title.slice(0, 34)}”`;
+    const fs: Field[] = [found("Job Title", "text", title, `${srcBase} .experience-item__title`, 0.9)];
+    if (company) fs.push(found("Company", "text", company, `${srcBase} .experience-item__subtitle`, 0.85));
+    if (type) fs.push(found("Employment Type", "text", type, `${srcBase} .experience-item__subtitle`, 0.8));
+    if (dates) {
+      const parts = dates.split(/\s*(?:-|–|—|to)\s*/);
+      fs.push(found("Start Date", "text", parts[0] ?? dates, `${srcBase} .date-range`, 0.85));
+      fs.push(found("End Date", "text", parts[1] ?? "Present", `${srcBase} .date-range`, 0.85));
+    }
+    if (dur) { const f = found("Duration", "text", dur, `${srcBase} (derived)`, 0.8); f.status = "derived"; fs.push(f); }
+    if (desc) fs.push(found("Responsibilities", "text", desc.slice(0, 800), `${srcBase} .experience-item__description`, 0.75));
+    p.expEntries!.push(fs);
+    p.expMeta!.push({ title, company: company ?? "", type: type ?? "", range: dates, duration: dur, loc: null, bullets: desc ? [desc.slice(0, 300)] : [], skills: [] });
+  }
+
+  const edus = Array.from(doc.querySelectorAll(".education__item, section#education li"));
+  for (const it of edus.slice(0, 6)) {
+    const school = it.querySelector(".education__item--school-name")?.textContent?.trim() ?? "";
+    const degree = it.querySelector(".education__item--degree-name")?.textContent?.trim() ?? "";
+    const details = it.querySelector(".education__item--degree-details")?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    if (!school) continue;
+    const srcBase = `[L2] rendered DOM → Education “${school.slice(0, 30)}”`;
+    const fs: Field[] = [found("University", "text", school, `${srcBase} .school-name`, 0.9)];
+    if (degree) fs.push(found("Degree", "text", degree, `${srcBase} .degree-name`, 0.85));
+    const yr = details.match(/\d{4}\s*(?:-|–)\s*(?:\d{4}|present)/i)?.[0];
+    if (yr) {
+      const [a, b] = yr.split(/\s*(?:-|–)\s*/);
+      fs.push(found("Start Year", "text", a, `${srcBase} .degree-details`, 0.8));
+      fs.push(found("Graduation Year", "text", b, `${srcBase} .degree-details`, 0.8));
+    } else if (details) {
+      fs.push(found("Details", "text", details.slice(0, 200), `${srcBase} .degree-details`, 0.78));
+    }
+    p.eduEntries!.push(fs);
+    p.eduMeta!.push({ school, detail: degree, range: yr ?? "", grade: null, activities: null });
+  }
+
+  const sk = Array.from(doc.querySelectorAll("section#skills li, #skills .skill-card__name, .top-card-layout__skills li"))
+    .map((el) => el.textContent?.replace(/\s+/g, " ").trim() ?? "")
+    .filter((t) => t && t.length < 60);
+  p.skills = [...new Set(sk)].slice(0, 40);
+
+  const links: { text: string; href: string }[] = [];
+  doc.querySelectorAll("a[href^='http']").forEach((a) => {
+    const href = (a as HTMLAnchorElement).href;
+    if (!/linkedin\.com|licdn/.test(href)) links.push({ text: a.textContent?.trim() ?? "", href });
+  });
+  p.externalLinks = links.slice(0, 20);
+  p.openToWork = /open to work/i.test(doc.body.textContent ?? "");
+  return p;
+}
+
+/* L5 — Wayback Machine often holds pre-authwall snapshots; availability API is CORS-open. */
+async function fetchWaybackSnapshot(slug: string, parent: AbortSignal | undefined, log: LogSink): Promise<{ html: string; ts: string } | null> {
+  const target = `https://www.linkedin.com/in/${slug}`;
+  const api = `https://archive.org/wayback/available?url=${encodeURIComponent(target)}`;
+  try {
+    log("loophole L5 → archive.org/wayback/available — hunting for a cached snapshot …", "dim");
+    const res = await fetchWithTimeout(api, parent, 12000);
+    const j = await res.json();
+    const snap = j?.archived_snapshots?.closest;
+    if (!snap?.available) {
+      log("✗ L5 — no Wayback snapshot exists for this profile", "warn");
+      return null;
+    }
+    const rawUrl = String(snap.url).replace(/^http:\/\//, "https://").replace(/web\/(\d+)\//, "web/$1id_/");
+    log(`✓ L5 — snapshot found @ ${snap.timestamp} — pulling raw original …`, "info");
+    const got = await fetchText(rawUrl, parent, log, 18000);
+    if (got && got.html) return { html: got.html, ts: String(snap.timestamp) };
+    return null;
+  } catch (e) {
+    if (parent?.aborted) throw e;
+    log(`✗ L5 — wayback lookup failed (${(e as Error).name})`, "warn");
+    return null;
+  }
+}
+
+/* L6 — crawler-indexed identity snippets via Jina Search. */
+async function fetchJinaSearchSnippets(query: string, parent: AbortSignal | undefined, log: LogSink): Promise<string[]> {
+  const url = `https://s.jina.ai/${encodeURIComponent(query)}`;
+  try {
+    log(`loophole L6 → s.jina.ai search “${query}” …`, "dim");
+    const res = await fetchWithTimeout(url, parent, 18000, { headers: { Accept: "application/json" } });
+    const j = await res.json();
+    const items = Array.isArray(j?.data) ? j.data : [];
+    const out = items
+      .map((d: any) => [d.title, d.description, (d.content ?? "").slice(0, 400)].filter(Boolean).join(" — "))
+      .filter((s: string) => s.length > 20)
+      .slice(0, 4);
+    log(out.length ? `✓ L6 — ${out.length} indexed snippets recovered` : "✗ L6 — nothing indexable found", out.length ? "ok" : "warn");
+    return out;
+  } catch (e) {
+    if (parent?.aborted) throw e;
+    log(`✗ L6 — search tier failed (${(e as Error).name})`, "warn");
+    return [];
+  }
+}
+
+function harvestScore(h: LiHarvest): number {
+  let s = 0;
+  s += h.name ? 1 : 0; s += h.headline ? 1 : 0; s += h.location ? 1 : 0; s += h.about.length ? 1 : 0;
+  s += h.expEntries.length ? 1 : 0; s += h.eduEntries.length ? 1 : 0; s += h.skills.length ? 1 : 0;
+  s += h.certEntries.length ? 1 : 0; s += h.projEntries.length ? 1 : 0; s += h.honorEntries.length ? 1 : 0;
+  s += h.volunteerEntries.length ? 1 : 0; s += h.recommendations.length ? 1 : 0; s += h.organizations.length ? 1 : 0;
+  s += h.publications.length ? 1 : 0; s += h.patents.length ? 1 : 0; s += h.languages.length ? 1 : 0;
+  s += h.externalLinks.length ? 1 : 0; s += h.photo ? 1 : 0;
+  return s;
+}
+
+function mergeHarvest(base: LiHarvest, extra: Partial<LiHarvest>): void {
+  base.name ??= extra.name ?? null;
+  base.headline ??= extra.headline ?? null;
+  base.location ??= extra.location ?? null;
+  base.photo ??= extra.photo ?? null;
+  base.aboutMeta ??= extra.aboutMeta ?? null;
+  if (!base.about.length && extra.about?.length) base.about = extra.about;
+  if (!base.expEntries.length && extra.expEntries?.length) { base.expEntries = extra.expEntries; base.expMeta = extra.expMeta ?? []; }
+  if (!base.eduEntries.length && extra.eduEntries?.length) { base.eduEntries = extra.eduEntries; base.eduMeta = extra.eduMeta ?? []; }
+  if (!base.skills.length && extra.skills?.length) base.skills = extra.skills;
+  if (!base.projEntries.length && extra.projEntries?.length) base.projEntries = extra.projEntries;
+  if (!base.certEntries.length && extra.certEntries?.length) base.certEntries = extra.certEntries;
+  if (!base.honorEntries.length && extra.honorEntries?.length) base.honorEntries = extra.honorEntries;
+  if (!base.volunteerEntries.length && extra.volunteerEntries?.length) base.volunteerEntries = extra.volunteerEntries;
+  if (!base.recommendations.length && extra.recommendations?.length) base.recommendations = extra.recommendations;
+  if (!base.organizations.length && extra.organizations?.length) base.organizations = extra.organizations;
+  if (!base.publications.length && extra.publications?.length) base.publications = extra.publications;
+  if (!base.patents.length && extra.patents?.length) base.patents = extra.patents;
+  if (!base.languages.length && extra.languages?.length) base.languages = extra.languages;
+  if (!base.externalLinks.length && extra.externalLinks?.length) base.externalLinks = extra.externalLinks;
+  base.openToWork = base.openToWork || !!extra.openToWork;
+}
+
+/* ------------------------------------------------------------------ */
+/*  LinkedIn orchestrator — climbs the loophole ladder L0 → L6         */
 /* ------------------------------------------------------------------ */
 
 async function extractLinkedIn(slug: string, parent: AbortSignal | undefined, log: LogSink, pastedText?: string): Promise<SourceResult> {
   const url = `https://www.linkedin.com/in/${slug}/`;
   const traces: Trace[] = [];
-  let harvest: LiHarvest | null = null;
+  const tiers: TierOutcome[] = [];
+  let h: LiHarvest;
 
   if (pastedText && pastedText.trim().length > 60) {
-    log(`using operator-pasted profile text (${(pastedText.length / 1024).toFixed(1)} KB) — parsing locally`, "info");
-    traces.push({ via: "operator paste", url: "clipboard → local DOMParser", status: 200, bytes: pastedText.length, ms: 0, ok: true });
-    harvest = pastedText.trim().startsWith("<") ? parsePublicHtml(pastedText, slug) : parseJinaMarkdown({ title: "", content: pastedText, url }, slug);
-    harvest.via = "operator paste";
+    /* L0 — operator paste: full local parse, no network needed */
+    log(`L0 → using operator-pasted profile text (${(pastedText.length / 1024).toFixed(1)} KB) — parsing locally`, "info");
+    traces.push({ via: "operator paste", url: "clipboard → local parse", status: 200, bytes: pastedText.length, ms: 0, ok: true });
+    h = pastedText.trim().startsWith("<") ? parsePublicHtml(pastedText, slug) : parseJinaMarkdown({ title: "", content: pastedText, url }, slug);
+    h.via = "operator paste";
+    const doc = new DOMParser().parseFromString(pastedText, "text/html");
+    const v = parseVoyagerBlobs(doc);
+    if (v) h.voyager = v;
+    tiers.push({ tier: "L0", name: "operator paste", status: "hit", detail: `${(pastedText.length / 1024).toFixed(1)} KB parsed locally${v ? " · blobs recovered" : ""}`, fields: harvestScore(h) + (v ? voyagerScore(v) : 0) });
   } else {
-    // 1) Jina Reader — rendered page as markdown
-    const j = await fetchJina(url, parent, log);
-    traces.push(j.trace);
-    if (j.doc.content.length > 200) harvest = parseJinaMarkdown(j.doc, slug);
+    h = emptyHarvest("raw HTML");
 
-    // 2) raw HTML via relays — og/meta/JSON-LD + SSR sections
+    /* L1 + L4 — raw HTML via CORS relays: Voyager blobs + og/meta shell */
     const raw = await fetchText(url, parent, log);
+    if (raw) traces.push(...raw.traces);
     if (raw && raw.html) {
-      traces.push(...raw.traces);
       const hh = parsePublicHtml(raw.html, slug);
-      if (harvest) {
-        // merge: fill gaps
-        harvest.name ??= hh.name;
-        harvest.headline ??= hh.headline;
-        harvest.location ??= hh.location;
-        harvest.photo ??= hh.photo;
-        harvest.aboutMeta ??= hh.aboutMeta;
-        if (!harvest.about.length && hh.about.length) harvest.about = hh.about;
-        if (!harvest.externalLinks.length && hh.externalLinks.length) harvest.externalLinks = hh.externalLinks;
-        if (harvest.wall && !hh.wall) harvest.wall = false;
+      mergeHarvest(h, hh);
+      h.wall = hh.wall && h.about.length === 0;
+      const doc = new DOMParser().parseFromString(raw.html, "text/html");
+      const v = parseVoyagerBlobs(doc);
+      if (v) {
+        h.voyager = v;
+        log(`✓ L1 — VOYAGER PAYLOAD RECOVERED from <code> blobs: ${voyagerDetail(v)}`, "ok");
+        tiers.push({ tier: "L1", name: "voyager <code> blobs", status: "hit", detail: voyagerDetail(v), fields: voyagerScore(v) });
       } else {
-        harvest = hh;
+        tiers.push({ tier: "L1", name: "voyager <code> blobs", status: "miss", detail: h.wall ? "response was the authwall" : "no structured blobs in shell", fields: 0 });
       }
-    } else if (raw) {
-      traces.push(...raw.traces);
+      tiers.push({ tier: "L4", name: "og/meta/ld+json shell", status: h.name || h.headline ? "hit" : "miss", detail: h.name || h.headline ? "identity recovered from meta tags" : "shell carried no identity", fields: harvestScore(h) });
+    } else {
+      tiers.push({ tier: "L1", name: "voyager <code> blobs", status: "skip", detail: "no HTML retrieved", fields: 0 });
+      tiers.push({ tier: "L4", name: "og/meta/ld+json shell", status: "skip", detail: "all relays failed", fields: 0 });
+    }
+
+    /* L3 — Jina Reader markdown (section parser) */
+    const beforeL3 = harvestScore(h);
+    const jm = await fetchJina(url, parent, log);
+    traces.push(jm.trace);
+    if (jm.doc.content.length > 200) {
+      const hm = parseJinaMarkdown(jm.doc, slug);
+      mergeHarvest(h, hm);
+      if (harvestScore(h) > beforeL3 && h.via === "raw HTML") h.via = "jina-reader";
+    }
+    tiers.push({ tier: "L3", name: "reader markdown", status: harvestScore(h) > beforeL3 ? "hit" : "miss", detail: harvestScore(h) > beforeL3 ? "sections parsed from markdown" : "no new signal", fields: harvestScore(h) - beforeL3 });
+
+    /* L2 — Jina rendered DOM with LinkedIn class selectors */
+    const beforeL2 = harvestScore(h);
+    const jh = await fetchJinaHtml(url, parent, log);
+    traces.push(jh.trace);
+    let l2Bonus = 0;
+    if (jh.html.length > 200) {
+      const dom = parseRenderedDom(jh.html);
+      mergeHarvest(h, dom);
+      if (!h.voyager) {
+        const v2 = parseVoyagerBlobs(new DOMParser().parseFromString(jh.html, "text/html"));
+        if (v2) { h.voyager = v2; l2Bonus = voyagerScore(v2); log(`✓ L2 — voyager blobs also found in rendered DOM: ${voyagerDetail(v2)}`, "ok"); }
+      }
+    }
+    const l2Gain = harvestScore(h) - beforeL2 + l2Bonus;
+    tiers.push({ tier: "L2", name: "rendered DOM (jina html)", status: l2Gain > 0 ? "hit" : "miss", detail: l2Gain > 0 ? "class-based sections parsed" : "DOM added nothing new", fields: l2Gain });
+
+    /* L5 — Wayback snapshot if identity/experience still missing */
+    const identityGap = !(h.name && (h.expEntries.length || h.voyager));
+    if (identityGap) {
+      const beforeL5 = harvestScore(h);
+      const wb = await fetchWaybackSnapshot(slug, parent, log);
+      if (wb) {
+        traces.push({ via: "wayback", url: `web.archive.org snapshot ${wb.ts}`, status: 200, bytes: wb.html.length, ms: 0, ok: true });
+        const hb = parsePublicHtml(wb.html, slug);
+        mergeHarvest(h, hb);
+        let l5Bonus = 0;
+        if (!h.voyager) {
+          const vb = parseVoyagerBlobs(new DOMParser().parseFromString(wb.html, "text/html"));
+          if (vb) { h.voyager = vb; l5Bonus = voyagerScore(vb); }
+        }
+        tiers.push({ tier: "L5", name: "Wayback snapshot", status: "hit", detail: `archived ${wb.ts.slice(0, 8)}`, fields: harvestScore(h) - beforeL5 + l5Bonus });
+      } else {
+        tiers.push({ tier: "L5", name: "Wayback snapshot", status: "miss", detail: "no archived copy", fields: 0 });
+      }
+    } else {
+      tiers.push({ tier: "L5", name: "Wayback snapshot", status: "skip", detail: "identity already locked", fields: 0 });
+    }
+
+    /* L6 — search-index snippets for remaining identity/about gaps */
+    if (!h.about.length || !h.name) {
+      const snips = await fetchJinaSearchSnippets(`site:linkedin.com/in/${slug}`, parent, log);
+      if (snips.length) {
+        if (!h.about.length) h.about = [snips.join(" ").slice(0, 1500)];
+        tiers.push({ tier: "L6", name: "jina search snippets", status: "hit", detail: `${snips.length} indexed snippets`, fields: 1 });
+      } else {
+        tiers.push({ tier: "L6", name: "jina search snippets", status: "miss", detail: "not indexed", fields: 0 });
+      }
+    } else {
+      tiers.push({ tier: "L6", name: "jina search snippets", status: "skip", detail: "identity complete", fields: 0 });
     }
   }
 
-  if (!harvest || (!harvest.name && !harvest.headline && harvest.about.length === 0)) {
-    const wallGuess = true;
-    const mods = buildLinkedInModules(emptyHarvest("none"), slug, url);
-    for (const m of mods) {
-      m.summary = "no anonymous response received";
-    }
+  if (!h.name && !h.headline && !h.about.length && !h.voyager) {
+    const mods = buildLinkedInModules(h, slug, url);
     return {
-      id: "linkedin", label: "LinkedIn", status: "failed", handle: slug, url, modules: mods, traces,
+      id: "linkedin", label: "LinkedIn", status: "failed", handle: slug, url, modules: mods, traces, tiers,
       stats: tally(mods),
-      error: wallGuess
-        ? "Every relay and the reader failed or returned LinkedIn's authwall. The public shell for this slug was not retrievable from this network — paste the profile text below the inputs (or run maxun-core with a session cookie) to get full fields."
-        : "Could not retrieve the LinkedIn page.",
+      error: "Every tier of the loophole ladder came back empty — the relays, the reader, Wayback and search all failed from this network. Paste the profile text (L0) or run maxun-core with a session cookie.",
     };
   }
 
-  if (harvest.wall) log("⚠ authwall detected — anonymous response is limited; session-backed fetch (maxun-core) required for locked fields", "warn");
-  else log(`✓ public profile shell parsed via ${harvest.via}`, "ok");
+  const wall = h.wall && !h.voyager;
+  if (wall) log("⚠ authwall limited the anonymous response — locked fields are flagged AUTH, not invented", "warn");
+  else log(`✓ ladder complete — best tier: ${h.voyager ? "L1 voyager blobs" : h.via}`, "ok");
 
-  const mods = buildLinkedInModules(harvest, slug, url);
+  let mods = buildLinkedInModules(h, slug, url);
+  if (h.voyager) mods = overlayVoyager(mods, h.voyager, slug, url);
   const stats = tally(mods);
   return {
     id: "linkedin", label: "LinkedIn",
-    status: harvest.wall ? "partial" : "ok",
-    handle: slug, url, avatar: harvest.photo ?? undefined, modules: mods, traces, stats,
-    error: harvest.wall ? "Authwall-limited response: fields behind login are flagged AUTH — real, not guessed." : undefined,
+    status: wall ? "partial" : "ok",
+    handle: slug, url, avatar: h.photo ?? h.voyager?.photo, modules: mods, traces, tiers, stats,
+    error: wall ? "Authwall-limited response: locked fields are flagged AUTH — real gaps, honestly reported." : undefined,
   };
 }
 

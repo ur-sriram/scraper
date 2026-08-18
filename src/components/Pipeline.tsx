@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { Icon } from "./icons";
-import type { ExtractInput, LogTone, ModuleData, SourceId, SourceUi } from "../lib/engine";
+import type { ExtractInput, LogTone, ModuleData, SourceId, SourceUi, TierOutcome } from "../lib/engine";
 
 export interface LogLine {
   t: string;
@@ -11,6 +11,7 @@ export interface LogLine {
 interface PipelineProps {
   sourceStatus: Record<SourceId, SourceUi>;
   modules: Record<SourceId, ModuleData[]>;
+  tiers: Record<SourceId, TierOutcome[]>;
   targets: ExtractInput;
   logs: LogLine[];
   elapsedMs: number;
@@ -39,7 +40,7 @@ const TONE_CLS: Record<LogTone, string> = {
   err: "text-blush-400",
 };
 
-export function Pipeline({ sourceStatus, modules, targets, logs, elapsedMs, phase }: PipelineProps) {
+export function Pipeline({ sourceStatus, modules, tiers, targets, logs, elapsedMs, phase }: PipelineProps) {
   const termRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = termRef.current;
@@ -106,6 +107,24 @@ export function Pipeline({ sourceStatus, modules, targets, logs, elapsedMs, phas
                   {st === "running" && (
                     <div className="mt-3 h-0.5 overflow-hidden bg-ink-800">
                       <div className="h-full w-full tickflow" />
+                    </div>
+                  )}
+
+                  {(tiers[s.id] ?? []).length > 0 && (st === "done" || st === "failed") && (
+                    <div className="mt-3 border-t border-ink-800/70 pt-2.5">
+                      <div className="font-mono text-[9px] tracking-[0.2em] text-fog-600 mb-1.5">LOO PHOLE LADDER</div>
+                      <div className="space-y-1">
+                        {(tiers[s.id] ?? []).map((t) => (
+                          <div key={t.tier} className="flex items-center gap-2 font-mono text-[10px]">
+                            <span className="text-mint-400 w-6 shrink-0">{t.tier}</span>
+                            <span className={`w-12 shrink-0 ${t.status === "hit" ? "text-mint-300" : t.status === "skip" ? "text-fog-600" : "text-ember-300"}`}>
+                              {t.status === "hit" ? "● HIT" : t.status === "skip" ? "○ SKIP" : "✕ MISS"}
+                            </span>
+                            <span className="text-fog-300 truncate">{t.name}</span>
+                            {t.fields > 0 && <span className="text-mint-300 ml-auto shrink-0">+{t.fields}</span>}
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>

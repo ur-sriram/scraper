@@ -197,10 +197,11 @@ export function Console({ targets, onTarget, pastedText, onPastedText, onRun, bu
             </div>
             <dl className="space-y-3 text-sm">
               {[
-                { k: "engine", v: "sieve live-extract v2.1", mono: true },
-                { k: "linkedin path", v: "jina reader + 3 CORS relays → parser", mono: true },
-                { k: "github path", v: "api.github.com (direct, CORS-enabled)", mono: true },
-                { k: "leetcode path", v: "stats API → wrapper → GraphQL", mono: true },
+                { k: "engine", v: "sieve live-extract v3 · ladder", mono: true },
+                { k: "L1", v: "voyager <code> JSON blobs", mono: true },
+                { k: "L2", v: "rendered DOM · class selectors", mono: true },
+                { k: "L3 / L4", v: "reader markdown · og/meta shell", mono: true },
+                { k: "L5 / L6", v: "Wayback snapshot · search index", mono: true },
                 { k: "auth tier", v: "Phase 01.5 · maxun-core + session cookie", mono: false },
               ].map((r) => (
                 <div key={r.k} className="flex items-baseline justify-between gap-3 border-b border-ink-800/80 pb-2.5">
@@ -217,10 +218,11 @@ export function Console({ targets, onTarget, pastedText, onPastedText, onRun, bu
               </div>
               <p className="text-xs leading-relaxed text-fog-500">
                 LinkedIn serves anonymous browsers an <span className="text-ember-300 font-mono">authwall</span>. The
-                live tier extracts whatever the public shell exposes — name, headline, About, photo, and any public
-                Experience / Education / Skills sections. What the wall locks is reported as{" "}
+                ladder exploits every anonymous opening — L1 recovers the Voyager JSON blobs LinkedIn hides in{" "}
+                <span className="font-mono text-ember-300">&lt;code&gt;</span> tags, L2 parses the rendered DOM, L5
+                pulls Wayback snapshots, L6 mines the search index. Whatever still sits behind login is reported as{" "}
                 <span className="font-mono text-ember-300">AUTH</span>, never invented. GitHub &amp; LeetCode are open
-                APIs — that data is 100% live. Paste the profile text to unlock the rest without a backend.
+                APIs — 100% live. Paste the profile text to unlock the rest without a backend.
               </p>
             </div>
           </aside>

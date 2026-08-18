@@ -245,15 +245,16 @@ export default function App() {
               <span className="text-fog-500">Zero invented fields.</span>
             </h1>
             <p className="mt-5 text-fog-500 max-w-xl leading-relaxed">
-              Paste the handles your candidate gives you. SIEVE renders the LinkedIn public page through a reader and
-              CORS relays, parses whatever the wall allows, hits GitHub&apos;s official REST API, and queries
-              LeetCode&apos;s public stats — every field below is stamped with the exact HTTP request it came from.
+              Paste the handles your candidate gives you. For LinkedIn, SIEVE climbs a 7-tier loophole ladder — hidden
+              Voyager JSON blobs, the rendered DOM, reader markdown, meta shell, Wayback snapshots, search-index
+              snippets — keeping whatever each tier recovers. GitHub hits the official REST API; LeetCode the public
+              stats endpoints. Every field is stamped with the exact request it came from.
             </p>
           </div>
           <dl className="border border-ink-700/70 bg-ink-900/40 p-5 grid grid-cols-3 gap-4 text-center">
             {[
               { k: "3", v: "live sources" },
-              { k: "4", v: "fetch paths" },
+              { k: "7", v: "ladder tiers" },
               { k: "0", v: "fake fields" },
             ].map((s) => (
               <div key={s.v}>
@@ -281,6 +282,11 @@ export default function App() {
             <Pipeline
               sourceStatus={sourceStatus}
               modules={modules}
+              tiers={{
+                linkedin: extraction?.results.find((r) => r.id === "linkedin")?.tiers ?? [],
+                github: [],
+                leetcode: [],
+              }}
               targets={targets}
               logs={logs}
               elapsedMs={elapsedMs}
